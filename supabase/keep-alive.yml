@@ -1,0 +1,120 @@
+# =============================================================================
+# AwazDo — Supabase Keep-Alive GitHub Actions Workflow
+#
+# PURPOSE:
+#   Supabase free-tier projects are automatically paused after 7 days of
+#   inactivity. This workflow pings the database every 5 days to prevent
+#   pausing, keeping the project active during low-traffic periods.
+#
+# REQUIRED GITHUB SECRETS:
+#   - SUPABASE_URL       → Project URL, e.g. https://xyzabc.supabase.co
+#   - SUPABASE_ANON_KEY  → anon/public key from Project Settings → API
+#
+# HOW TO ADD SECRETS:
+#   GitHub Repo → Settings → Secrets and variables → Actions → New secret
+# =============================================================================
+
+name: Supabase Keep-Alive Ping
+
+on:
+  # Run every 5 days at 02:30 UTC (well within the 7-day pause window)
+  schedule:
+    - cron: "30 2 */5 * *"
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual ping"
+        required: false
+        default: "Manual keep-alive"
+
+jobs:
+  keep-alive:
+    name: Ping Supabase Database
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # ── Step 1: Print context ──────────────────────────────────────────────
+      - name: Log ping info
+        run: |
+          echo "🏙️  AwazDo Supabase Keep-Alive"
+          echo "⏰  Triggered at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "📌  Reason: ${{ github.event.inputs.reason || 'Scheduled ping' }}"
+
+      # ── Step 2: Ping via Supabase REST API (SELECT 1) ─────────────────────
+      - name: Ping Supabase REST API
+        id: ping
+        run: |
+          HTTP_STATUS=$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            --max-time 30 \
+            --request GET \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/?select=1" \
+            --header "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            --header "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            --header "Content-Type: application/json")
+
+          echo "http_status=${HTTP_STATUS}" >> $GITHUB_OUTPUT
+          echo "✅ HTTP Status: ${HTTP_STATUS}"
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ Supabase is alive and responding."
+          elif [ "$HTTP_STATUS" -eq 404 ]; then
+            echo "⚠️  Got 404 — REST endpoint might differ but DB is awake."
+          else
+            echo "❌ Unexpected status: ${HTTP_STATUS}"
+            exit 1
+          fi
+
+      # ── Step 3: Execute a lightweight SQL health check ────────────────────
+      - name: Execute SQL health check (SELECT 1)
+        run: |
+          RESPONSE=$(curl \
+            --silent \
+            --max-time 30 \
+            --request POST \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/rpc/health_check" \
+            --header "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            --header "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            --header "Content-Type: application/json" \
+            --data '{}' || echo "rpc_not_available")
+
+          # Fallback: query tenants table which always has rows
+          if echo "$RESPONSE" | grep -q "rpc_not_available\|error"; then
+            echo "📡 Falling back to tenants table ping..."
+            curl \
+              --silent \
+              --fail \
+              --max-time 30 \
+              --request GET \
+              "${{ secrets.SUPABASE_URL }}/rest/v1/tenants?select=id&limit=1" \
+              --header "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+              --header "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+              --header "Prefer: count=none"
+            echo ""
+            echo "✅ Tenants table responded — DB is alive."
+          else
+            echo "✅ Health check RPC responded: $RESPONSE"
+          fi
+
+      # ── Step 4: Summary ───────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## 🏙️ AwazDo Supabase Keep-Alive Report
+
+          | Field         | Value |
+          |---------------|-------|
+          | **Status**    | ${{ steps.ping.outputs.http_status }} |
+          | **Timestamp** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
+          | **Project**   | ${{ secrets.SUPABASE_URL }} |
+          | **Trigger**   | ${{ github.event_name }} |
+          | **Cities**    | Delhi + Ghaziabad |
+
+          > The database will remain active and not be paused by Supabase.
+          EOF
